@@ -77,6 +77,12 @@ def _connect_to_wp_mysql(cfg):
         kwds['host'] = '%s.analytics.db.svc.eqiad.wmflabs' % xxwiki
     return _connect(**kwds)
 
+def _connect_to_cd_mysql():
+    kwds = {'read_default_file': REPLICA_MY_CNF}
+    if utils.running_in_tools_labs():
+        kwds['host'] = TOOLS_LABS_CH_MYSQL_HOST
+    return _connect(**kwds)
+
 def _make_tools_labs_dbname(cursor, database, lang_code):
     cursor.execute("SELECT SUBSTRING_INDEX(USER(), '@', 1)")
     user = cursor.fetchone()[0]
@@ -123,6 +129,14 @@ def init_wp_replica_db(lang_code):
         db = _connect_to_wp_mysql(cfg)
         with db.cursor() as cursor:
             cursor.execute('USE ' + cfg.database)
+        return db
+    return _RetryingConnection(connect_and_initialize)
+
+def init_cd_db():
+    cfg = config.get_localized_config()
+    def connect_and_initialize():
+        db = _connect_to_cd_mysql()
+        _use(db.cursor(), 'citationdetective', cfg.lang_code)
         return db
     return _RetryingConnection(connect_and_initialize)
 
@@ -237,6 +251,29 @@ def initialize_all_databases():
         _create_citationhunt_tables(cfg, cursor)
         _use(cursor, 'stats', 'global')
         _create_stats_tables(cfg, cursor)
+
+def _create_citationdetective_tables(cfg, cursor):
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS statements (
+        id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY, hashid VARCHAR(128),
+        statement VARCHAR(1000), context VARCHAR(5000), 
+        section VARCHAR(768), rev_id INT(8) UNSIGNED, score FLOAT(8))
+    ''')
+
+def initialize_cd_database():
+    def _do_create_database(cursor, database, lang_code):
+        dbname = _make_tools_labs_dbname(cursor, database, lang_code)
+        cursor.execute('SET SESSION sql_mode = ""')
+        cursor.execute(
+            'CREATE DATABASE IF NOT EXISTS %s '
+            'CHARACTER SET utf8mb4' % dbname)
+    cfg = config.get_localized_config()
+    db = _RetryingConnection(_connect_to_cd_mysql)
+    with db.cursor() as cursor, ignore_warnings():
+        for database in ['citationdetective']:
+            _do_create_database(cursor, database, cfg.lang_code)
+        _use(cursor, 'citationdetective', cfg.lang_code)
+        _create_citationdetective_tables(cfg, cursor)
 
 def install_scratch_db():
     cfg = config.get_localized_config()
