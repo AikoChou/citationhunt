@@ -34,10 +34,9 @@ _SNIPPET_ROOT_TAGS = set(['p']) | _LIST_TAGS
 class SnippetParser(object):
     '''A base class for snippet parsers in various languages.'''
 
-    def __init__(self, wikipedia, cfg, source='wp'):
+    def __init__(self, wikipedia, cfg):
         self._cfg = cfg
         self._wikipedia = wikipedia
-        self._source = source
 
         self._lowercase_cn_templates = set(
             t.lower() for t in self._resolve_redirects_to_templates(
@@ -139,14 +138,10 @@ class SnippetParser(object):
                 ...
             ]
         """
-        if self._source == 'wp':
-            wikicode = self._fast_parse(wikitext)
-            if wikicode is None:
-                # Fall back to full parsing if fast parsing fails
-                wikicode = mwparserfromhell.parse(wikitext)
-
-        if self._source == 'cd':
-            wikicode = wikitext
+        wikicode = self._fast_parse(wikitext)
+        if wikicode is None:
+            # Fall back to full parsing if fast parsing fails
+            wikicode = mwparserfromhell.parse(wikitext)
 
         sections = wikicode.get_sections(
             include_lead = True, include_headings = True, flat = True)
@@ -335,5 +330,5 @@ class SnippetParser(object):
     def _is_citation_needed(self, template):
         return template.name.lower().strip() in self._lowercase_cn_templates
 
-def create_snippet_parser(wikipedia, cfg, source):
-    return SnippetParser(wikipedia, cfg, source)
+def create_snippet_parser(wikipedia, cfg):
+    return SnippetParser(wikipedia, cfg)

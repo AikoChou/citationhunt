@@ -41,10 +41,8 @@ import types
 import urllib.request, urllib.parse, urllib.error
 import pickle as pickle
 
-import nltk
 import mwapi
 import mwparserfromhell
-from mwparserfromhell.nodes.text import Text
 import pandas as pd
 
 cfg = config.get_localized_config()
@@ -57,8 +55,7 @@ MAX_EXCEPTIONS_PER_SUBPROCESS = 5
 DATA_TRUNCATED_WARNING_RE = re.compile(
     'Data truncated for column .* at row (\d+)')
 
-CITATION_NEEDED_TEMPLATE = "{{Citation needed|reason=Added by Citation Detective|date=%s}}" % pd.datetime.now().strftime("%B %Y")
-CITATION_NEEDED_TEMPLATE = mwparserfromhell.parse(CITATION_NEEDED_TEMPLATE).filter_templates()[0]
+cn_tpl = "{{Citation needed|date=%s}}" % pd.datetime.now().strftime("%B %Y")
 
 #logger = logging.getLogger('parse_live')
 #setup_logger_to_stderr(logger)
@@ -105,7 +102,7 @@ def initializer(backdir):
     self.backdir = backdir
 
     self.wiki = yamwapi.MediaWikiAPI(WIKIPEDIA_API_URL, cfg.user_agent)
-    self.parser = snippet_parser.create_snippet_parser(self.wiki, cfg, 'cd')
+    self.parser = snippet_parser.create_snippet_parser(self.wiki, cfg)
     self.exception_count = 0
     """
     if cfg.profile:
@@ -122,78 +119,21 @@ def finalizer():
     with open(stats_path, 'wb') as stats_f:
         pickle.dump(self.parser.stats, stats_f)
 
-def _add_citation_needed_tpl(statement, section):
-    match = False
-    for text in section.filter_text():
-        # a text node may contains elements from multiple sentences 
-        tokens = nltk.tokenize.sent_tokenize(text.value)
-        if not tokens:
-            continue
-        for i, token in enumerate(tokens):
-            if token.strip() == statement[:len(token.strip())].strip():
-                statement = statement[len(token.strip()):].strip()
-                if not statement:
-                    match = True
-                    # match first token
-                    if i == 0:
-                        if len(tokens) == 1:
-                            section.insert_after(text, CITATION_NEEDED_TEMPLATE)
-                        else:
-                            section.insert_before(text, Text(token))
-                            section.insert_before(text, CITATION_NEEDED_TEMPLATE)
-                            for k in range(i+1, len(tokens)):
-                                section.insert_after(text, Text(tokens[k]))
-                            section.remove(text)
-                    # match last token
-                    elif i == len(tokens)-1:
-                        section.insert_after(text, CITATION_NEEDED_TEMPLATE)
-                    # match token in between
-                    else:
-                        for k in range(0, i+1): 
-                            section.insert_before(text, Text(tokens[k]))
-                        section.insert_before(text, CITATION_NEEDED_TEMPLATE)
-                        for k in range(i+1, len(tokens)):
-                            section.insert_after(text, Text(tokens[k]))
-                        section.remove(text)
-                    return match
-    return match
-
-def add_citation_needed_tpl(wikitext, df):
-    cn_count = 0
-    wikicode = mwparserfromhell.parse(wikitext)
-    sections = wikicode.get_sections(levels=[2], include_lead=True)
-    for section in sections:
-        headings = section.filter_headings()
-        if not headings:
-            if 'main_section' in df.section.unique():
-                for statement in df[df.section == 'main_section']['statement'].values:
-                    if _add_citation_needed_tpl(statement, section):
-                        cn_count += 1
-            continue
-
-        section_name = headings[0].title.strip().lower()
-        if section_name in df.section.unique():
-            for statement in df[df.section == section_name]['statement'].values:
-                if _add_citation_needed_tpl(statement, section):
-                    cn_count += 1
-    return wikicode, cn_count
-
 def process(df):
-    _tpl_added = 0
-    _num_snippet = 0
-
     rows = []
     results = query_revids(df.rev_id.unique())
     for revid, pageid, title, wikitext in results:
-        #print(pageid, title)
-        wikicode, cn = add_citation_needed_tpl(wikitext, df[df.rev_id == revid])
-        _tpl_added += cn
-        
+        for sentence in df[df.rev_id == revid].statement.values:
+            start = wikitext.find(sentence)
+            if start >= 0:
+                end = start + len(sentence)
+                wikitext = wikitext[:end] + cn_tpl + wikitext[end:]
+            else:
+                print("Not found: ", sentence)
+
         url = WIKIPEDIA_WIKI_URL + title.replace(' ', '_')
         snippets_rows = []
-        snippets = self.parser.extract(wikicode)
-        _num_snippet += len(snippets)
-        
+        snippets = self.parser.extract(wikitext)
         for sec, snips in snippets:
             sec = section_name_to_anchor(sec)
             for sni in snips:
@@ -237,13 +177,8 @@ def process(df):
     db = chdb.init_scratch_db()
     for r in rows:
         db.execute_with_retry(insert, r)
-    
-    return _tpl_added, _num_snippet
 
 def parse_live(df, timeout):
-    tpl_added = 0
-    snippet_count = 0
-
     backdir = tempfile.mkdtemp(prefix = 'citationhunt_parse_live_')
     initializer(backdir)
 
@@ -251,21 +186,15 @@ def parse_live(df, timeout):
     batch_size = 32
     revids_list = list(df.rev_id.unique())
     for i in range(0, len(revids_list), batch_size):
-        _tpl_added, _num_snippet = process(df[df.rev_id.isin(revids_list[i:i+batch_size])])
-
-        tpl_added += _tpl_added
-        snippet_count += _num_snippet
-
-    print("number of {{cn}} added: ", tpl_added)
-    print("number of snippets found: ", snippet_count)
+        process(df[df.rev_id.isin(revids_list[i:i+batch_size])])
     return 0
 
-def query_citation_detective(cn_score, size):
+def query_citation_detective(cn_score):
     db = chdb.init_cd_db()
     cursor = db.cursor()
     cursor.execute( # limit number of rows for testing
         '''SELECT statement, section, rev_id FROM statements WHERE score > %s
-         ORDER BY rev_id, section LIMIT %s''', (cn_score, size))
+         ORDER BY rev_id, section''' % cn_score)
     return pd.DataFrame(cursor.fetchall(), columns=['statement', 'section', 'rev_id'])
 
 if __name__ == '__main__':
@@ -274,11 +203,9 @@ if __name__ == '__main__':
     if timeout == float('inf'):
         timeout = None
     start = time.time()
-    df = query_citation_detective(0.5, 10000)
+    df = query_citation_detective(0.5)
     print("number of article: ", df.rev_id.nunique())
     print("number of statements: ", df.shape[0])
-    print('query cd done in %d seconds.' % (time.time() - start))
-    
     ret = parse_live(df, timeout)
     print('all done in %d seconds.' % (time.time() - start))
     sys.exit(ret)

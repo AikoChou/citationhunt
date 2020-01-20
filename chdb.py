@@ -252,29 +252,6 @@ def initialize_all_databases():
         _use(cursor, 'stats', 'global')
         _create_stats_tables(cfg, cursor)
 
-def _create_citationdetective_tables(cfg, cursor):
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS statements (
-        id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY, hashid VARCHAR(128),
-        statement VARCHAR(1000), context VARCHAR(5000), 
-        section VARCHAR(768), rev_id INT(8) UNSIGNED, score FLOAT(8))
-    ''')
-
-def initialize_cd_database():
-    def _do_create_database(cursor, database, lang_code):
-        dbname = _make_tools_labs_dbname(cursor, database, lang_code)
-        cursor.execute('SET SESSION sql_mode = ""')
-        cursor.execute(
-            'CREATE DATABASE IF NOT EXISTS %s '
-            'CHARACTER SET utf8mb4' % dbname)
-    cfg = config.get_localized_config()
-    db = _RetryingConnection(_connect_to_cd_mysql)
-    with db.cursor() as cursor, ignore_warnings():
-        for database in ['citationdetective']:
-            _do_create_database(cursor, database, cfg.lang_code)
-        _use(cursor, 'citationdetective', cfg.lang_code)
-        _create_citationdetective_tables(cfg, cursor)
-
 def install_scratch_db():
     cfg = config.get_localized_config()
     with init_db(cfg.lang_code).cursor() as cursor:
