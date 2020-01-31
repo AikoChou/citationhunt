@@ -9,7 +9,7 @@ valid snippets in the `articles` database table, and the snippets in the
 `snippets` table.
 
 Usage:
-    parse_live.py <pageid-file> [--timeout=<n>]
+    parse_live.py [<pageid-file>] [--timeout=<n>]
 
 Options:
     --timeout=<n>    Maximum time in seconds to run for [default: inf].
@@ -25,7 +25,8 @@ if _upper_dir not in sys.path:
 
 import chdb
 import config
-import yamwapi as mwapi
+import yamwapi
+import mwapi
 import snippet_parser
 from utils import *
 
@@ -89,12 +90,37 @@ def query_pageids(wiki, pageids):
             text = d(text)
             yield (id, title, text)
 
+def query_revids(revids):
+    session = mwapi.Session(WIKIPEDIA_BASE_URL, cfg.user_agent, formatversion=2)
+
+    response_docs = session.post(action='query',
+                                prop='revisions',
+                                rvprop='ids|content',
+                                revids='|'.join(map(str, revids)),
+                                format='json',
+                                utf8='',
+                                rvslots='*',
+                                continuation=True)
+
+    for doc in response_docs:
+        for page in doc['query']['pages']:
+            pageid = page['pageid']
+            revid = page['revisions'][0]['revid']
+            if 'title' not in page:
+                continue
+            title = d(page['title'])
+            text = page['revisions'][0]['slots']['main']['content']
+            if not text:
+                continue
+            text = d(text)
+            yield (revid, pageid, title, text)
+
 self = types.SimpleNamespace() # Per-process state
 
 def initializer(backdir):
     self.backdir = backdir
 
-    self.wiki = mwapi.MediaWikiAPI(WIKIPEDIA_API_URL, cfg.user_agent)
+    self.wiki = yamwapi.MediaWikiAPI(WIKIPEDIA_API_URL, cfg.user_agent)
     self.parser = snippet_parser.create_snippet_parser(self.wiki, cfg)
     self.exception_count = 0
 
@@ -125,6 +151,60 @@ def with_max_exceptions(fn):
                 raise
     return wrapper
 
+def insert(cursor, r):
+    cursor.execute('''
+        INSERT INTO articles VALUES(%s, %s, %s)''', r['article'])
+    cursor.executemany('''
+        INSERT IGNORE INTO snippets VALUES(%s, %s, %s, %s)''',
+        r['snippets'])
+
+    # We can't allow data to be truncated for HTML snippets, as that can
+    # completely break the UI, so we detect truncation warnings and get rid
+    # of the corresponding data.
+    warnings = cursor.execute('SHOW WARNINGS')
+    truncated_snippets = []
+    for _, _, message in cursor.fetchall():
+        m = DATA_TRUNCATED_WARNING_RE.match(message)
+        if m is None:
+            # Not a truncation, ignore (it's already logged)
+            continue
+        # MySQL warnings index rows starting at 1
+        idx = int(m.groups()[0]) - 1
+        truncated_snippets.append((r['snippets'][idx][0],))
+    if len(truncated_snippets) < len(r['snippets']):
+        cursor.executemany('''
+            DELETE FROM snippets WHERE id = %s''', truncated_snippets)
+    else:
+        # Every single snippet was truncated, remove the article itself
+        cursor.execute('''DELETE FROM articles WHERE page_id = %s''',
+            (r['article'][0],))
+
+@with_max_exceptions
+def work_sentences(sentences):
+    rows = []
+    results = query_revids(set([row[0] for row in sentences]))
+    for revid, pageid, title, wikitext in results:
+        url = WIKIPEDIA_WIKI_URL + title.replace(' ', '_')
+        snippets_rows = []
+
+        sents = [row[1] for row in sentences if row[0] == revid]
+        snippets = self.parser.extract_from_sentences(wikitext, sents)
+        for sec, snips in snippets:
+            sec = section_name_to_anchor(sec)
+            for sni in snips:
+                id = mkid(title + sni)
+                row = (id, sni, sec, pageid)
+                snippets_rows.append(row)
+
+        if snippets_rows:
+            article_row = (pageid, url, title)
+            rows.append({'article': article_row, 'snippets': snippets_rows})
+    # Open a short-lived connection to try to avoid the limit of 20 per user:
+    # https://phabricator.wikimedia.org/T216170
+    db = chdb.init_scratch_db()
+    for r in rows:
+        db.execute_with_retry(insert, r)
+
 @with_max_exceptions
 def work(pageids):
     rows = []
@@ -144,41 +224,13 @@ def work(pageids):
         if snippets_rows:
             article_row = (pageid, url, title)
             rows.append({'article': article_row, 'snippets': snippets_rows})
-
-    def insert(cursor, r):
-        cursor.execute('''
-            INSERT INTO articles VALUES(%s, %s, %s)''', r['article'])
-        cursor.executemany('''
-            INSERT IGNORE INTO snippets VALUES(%s, %s, %s, %s)''',
-            r['snippets'])
-
-        # We can't allow data to be truncated for HTML snippets, as that can
-        # completely break the UI, so we detect truncation warnings and get rid
-        # of the corresponding data.
-        warnings = cursor.execute('SHOW WARNINGS')
-        truncated_snippets = []
-        for _, _, message in cursor.fetchall():
-            m = DATA_TRUNCATED_WARNING_RE.match(message)
-            if m is None:
-                # Not a truncation, ignore (it's already logged)
-                continue
-            # MySQL warnings index rows starting at 1
-            idx = int(m.groups()[0]) - 1
-            truncated_snippets.append((r['snippets'][idx][0],))
-        if len(truncated_snippets) < len(r['snippets']):
-            cursor.executemany('''
-                DELETE FROM snippets WHERE id = %s''', truncated_snippets)
-        else:
-            # Every single snippet was truncated, remove the article itself
-            cursor.execute('''DELETE FROM articles WHERE page_id = %s''',
-                (r['article'][0],))
     # Open a short-lived connection to try to avoid the limit of 20 per user:
     # https://phabricator.wikimedia.org/T216170
     db = chdb.init_scratch_db()
     for r in rows:
         db.execute_with_retry(insert, r)
 
-def parse_live(pageids, timeout):
+def parse_live(pageids, sentences, timeout):
     backdir = tempfile.mkdtemp(prefix = 'citationhunt_parse_live_')
     pool = multiprocessing.Pool(
         # The number of processes per CPU is pretty much made up. The processes
@@ -186,14 +238,21 @@ def parse_live(pageids, timeout):
         processes = multiprocessing.cpu_count() * 8,
         initializer = initializer, initargs = (backdir,))
 
-    # Make sure we query the API 32 pageids at a time
+    # Make sure we query the API 32 pageids/revids at a time
     tasks = []
     batch_size = 32
-    pageids_list = list(pageids)
-    for i in range(0, len(pageids), batch_size):
-        tasks.append(pageids_list[i:i+batch_size])
 
-    result = pool.map_async(work, tasks)
+    if pageids:
+        pageids_list = list(pageids)
+        for i in range(0, len(pageids), batch_size):
+            tasks.append(pageids_list[i:i+batch_size])
+        result = pool.map_async(work, tasks)
+    else:
+        revids_list = list(set([revid for revid, _ in sentences]))
+        for i in range(0, len(revids_list), batch_size):
+            tasks.append([row for row in sentences if row[0] in revids_list[i:i+batch_size]])
+        result = pool.map_async(work_sentences, tasks)
+
     pool.close()
 
     if timeout is not None:
@@ -233,6 +292,14 @@ def parse_live(pageids, timeout):
     shutil.rmtree(backdir)
     return ret
 
+def load_sentences_from_cd(score):
+    db = chdb.init_cd_db()
+    cursor = db.cursor()
+    cursor.execute(
+        '''SELECT rev_id, statement FROM statements WHERE score > %s
+         ORDER BY rev_id''' % score)
+    return cursor.fetchall()
+
 if __name__ == '__main__':
     arguments = docopt.docopt(__doc__)
     pageids_file = arguments['<pageid-file>']
@@ -240,8 +307,12 @@ if __name__ == '__main__':
     if timeout == float('inf'):
         timeout = None
     start = time.time()
-    with open(pageids_file) as pf:
-        pageids = set(map(str.strip, pf))
-    ret = parse_live(pageids, timeout)
+    if pageids_file:
+        with open(pageids_file) as pf:
+            pageids = set(map(str.strip, pf))
+        ret = parse_live(pageids, None, timeout)
+    else:
+        sentences = load_sentences_from_cd(0.5)
+        ret = parse_live(None, sentences, timeout)
     logger.info('all done in %d seconds.' % (time.time() - start))
     sys.exit(ret)

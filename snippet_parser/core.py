@@ -28,6 +28,10 @@ CITATION_NEEDED_MARKER_CLASS = 'ch-cn-marker'
 _CITATION_NEEDED_MARKER_MARKUP = (
     '<span class="%s">{tpl}</span>' % CITATION_NEEDED_MARKER_CLASS)
 
+SENTENCE_MARKER_CLASS = 'sentence-marker'
+_SENTENCE_MARKER_MARKUP = (
+    '<span class="%s">{sent}</span>' % SENTENCE_MARKER_CLASS)
+
 _LIST_TAGS = set(['ol', 'ul'])
 _SNIPPET_ROOT_TAGS = set(['p']) | _LIST_TAGS
 
@@ -113,6 +117,100 @@ class SnippetParser(object):
         except mwparserfromhell.parser.ParserError:
             return None
 
+    def extract_from_sentences(self, wikitext, sentences):
+        for sent in sentences:
+            start = wikitext.find(sent)
+            marked = _SENTENCE_MARKER_MARKUP.format(sent = sent)
+            if start >= 0:
+                end = start + len(sent)
+                wikitext = wikitext[:start] + marked + wikitext[end:]
+            else:
+                print("Not found: ", sent)
+
+        wikicode = mwparserfromhell.parse(wikitext)
+        sections = wikicode.get_sections(
+            include_lead = True, include_headings = True, flat = True)
+
+        snippets = []
+        minlen, maxlen = self._cfg.snippet_min_size, self._cfg.snippet_max_size
+        for i, section in enumerate(sections):
+            for ref in section.filter_tags(matches = lambda t: t.tag == 'ref'):
+                if ref.has('group'):
+                    ref.remove('group')
+
+            try:
+                params = dict(
+                    text = str(section), **self._cfg.html_parse_parameters)
+                html = self._wikipedia.parse(params)['parse']['text']['*']
+            except:
+                continue
+
+            tree = lxml.html.parse(
+                StringIO.StringIO(html),
+                parser = lxml.html.HTMLParser(
+                    encoding = 'utf-8', remove_comments = True)).getroot()
+            if tree is None: continue
+
+            for strip_selector in self._html_css_selectors_to_strip:
+                for element in strip_selector(tree):
+                    inside_marker = any(
+                        e.attrib.get('class') == SENTENCE_MARKER_CLASS
+                        for e in element.iterancestors('span'))
+                    if not inside_marker:
+                        lxml_utils.remove_element(element)
+
+            snippet_roots = []
+            if self._cfg.extract == 'snippet':
+                # We climb up from each marker to the nearest antecessor element
+                # that we can use as a snippet.
+                for marker in tree.cssselect('.' + SENTENCE_MARKER_CLASS):
+                    root = marker.getparent()
+                    while root is not None and root.tag not in _SNIPPET_ROOT_TAGS:
+                        root = root.getparent()
+                    if root is None:
+                        continue
+                    if root.tag in _LIST_TAGS:
+                        snippet_roots = self._html_list_to_snippets(root)
+                    else:
+                        snippet_roots = [self._make_snippet_root(root)]
+            else:
+                # Throw away the actual template, we don't need it.
+                for marker in tree.cssselect('.' + SENTENCE_MARKER_CLASS):
+                    lxml_utils.remove_element(marker)
+
+                snippet_roots = [
+                    self._make_snippet_root(*(
+                        e for e in tree.cssselect(
+                            'body > ' + ', '.join(_SNIPPET_ROOT_TAGS))
+                        if e.text_content() and not e.text_content().isspace()))
+                ]
+
+            snippets_in_section = set()
+            for sr in snippet_roots:
+                lxml.etree.strip_tags(sr, 'a')
+                markers_in_snippet = sr.cssselect(
+                    '.' + SENTENCE_MARKER_CLASS)
+                lxml.etree.strip_attributes(sr, 'id', 'class', 'style')
+                sr.attrib['class'] = SNIPPET_WRAPPER_CLASS
+                for marker in markers_in_snippet:
+                    marker.attrib['class'] = SENTENCE_MARKER_CLASS
+                    lxml_utils.strip_space_before_element(marker)
+
+                length = len(sr.text_content().strip())
+                self.stats.snippet_lengths[length] += 1
+                if minlen < length < maxlen:
+                    snippet = d(lxml.html.tostring(
+                        sr, encoding = 'utf-8', method = 'html')).strip()
+                    snippets_in_section.add(snippet)
+
+            sectitle = ''
+            if i != 0:
+                sectitle = mwparserfromhell.parse(
+                    str(section.get(0).title).strip()).strip_code()
+            snippets.append([sectitle, list(snippets_in_section)])
+        return snippets
+
+
     def extract(self, wikitext):
         """
         This is the main method for extracting HTML snippets out of wiki markup.
@@ -138,11 +236,11 @@ class SnippetParser(object):
                 ...
             ]
         """
+
         wikicode = self._fast_parse(wikitext)
         if wikicode is None:
             # Fall back to full parsing if fast parsing fails
             wikicode = mwparserfromhell.parse(wikitext)
-
         sections = wikicode.get_sections(
             include_lead = True, include_headings = True, flat = True)
 
