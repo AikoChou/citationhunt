@@ -98,6 +98,7 @@ def _update_db_tools_labs(cfg):
     run_script(
         'print_unsourced_pageids_from_wikipedia.py', '> ' + unsourced.name)
     run_script('parse_live.py', unsourced.name)
+    run_script('parse_live.py --import_from_citationdetective 0.5')
     run_script('assign_categories.py')
     run_script('update_intersections.py')
     run_script('install_new_database.py')

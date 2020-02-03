@@ -9,7 +9,7 @@ valid snippets in the `articles` database table, and the snippets in the
 `snippets` table.
 
 Usage:
-    parse_live.py [<pageid-file>] [--timeout=<n>]
+    parse_live.py (--import_from_citationdetective <score> | <pageid-file>) [--timeout=<n>]
 
 Options:
     --timeout=<n>    Maximum time in seconds to run for [default: inf].
@@ -73,14 +73,19 @@ def section_name_to_anchor(section):
     section = section.replace('%', '.')
     return section
 
-def query_pageids(wiki, pageids):
+def query_pageids(wiki, pageids, revids):
     params = {
-        'pageids': '|'.join(map(str, pageids)),
         'prop': 'revisions',
-        'rvprop': 'content'
+        'rvprop': 'ids|content'
     }
+    if pageids:
+        params['pageids'] = '|'.join(map(str, pageids))
+    else:
+        params['revids'] = '|'.join(map(str, revids))
+
     for response in self.wiki.query(params):
         for id, page in list(response['query']['pages'].items()):
+            revid = page['revisions'][0]['revid']
             if 'title' not in page:
                 continue
             title = d(page['title'])
@@ -88,32 +93,7 @@ def query_pageids(wiki, pageids):
             if not text:
                 continue
             text = d(text)
-            yield (id, title, text)
-
-def query_revids(revids):
-    session = mwapi.Session(WIKIPEDIA_BASE_URL, cfg.user_agent, formatversion=2)
-
-    response_docs = session.post(action='query',
-                                prop='revisions',
-                                rvprop='ids|content',
-                                revids='|'.join(map(str, revids)),
-                                format='json',
-                                utf8='',
-                                rvslots='*',
-                                continuation=True)
-
-    for doc in response_docs:
-        for page in doc['query']['pages']:
-            pageid = page['pageid']
-            revid = page['revisions'][0]['revid']
-            if 'title' not in page:
-                continue
-            title = d(page['title'])
-            text = page['revisions'][0]['slots']['main']['content']
-            if not text:
-                continue
-            text = d(text)
-            yield (revid, pageid, title, text)
+            yield (id, revid, title, text)
 
 self = types.SimpleNamespace() # Per-process state
 
@@ -180,15 +160,22 @@ def insert(cursor, r):
             (r['article'][0],))
 
 @with_max_exceptions
-def work_sentences(sentences):
+def work(job):
     rows = []
-    results = query_revids(set([row[0] for row in sentences]))
-    for revid, pageid, title, wikitext in results:
+    CD_flag = True if isinstance(job[0], tuple) else False
+    if not CD_flag:
+        results = query_pageids(self.wiki, job, None)
+    else:
+        results = query_pageids(self.wiki, None, set([row[0] for row in job]))
+    for pageid, revid, title, wikitext in results:
         url = WIKIPEDIA_WIKI_URL + title.replace(' ', '_')
-        snippets_rows = []
 
-        sents = [row[1] for row in sentences if row[0] == revid]
-        snippets = self.parser.extract_from_sentences(wikitext, sents)
+        snippets_rows = []
+        if not CD_flag:
+            snippets = self.parser.extract(wikitext)
+        else:
+            sentences = [row[1] for row in job if row[0] == revid]
+            snippets = self.parser.extract_from_sentences(wikitext, sentences)
         for sec, snips in snippets:
             sec = section_name_to_anchor(sec)
             for sni in snips:
@@ -205,32 +192,7 @@ def work_sentences(sentences):
     for r in rows:
         db.execute_with_retry(insert, r)
 
-@with_max_exceptions
-def work(pageids):
-    rows = []
-    results = query_pageids(self.wiki, pageids)
-    for pageid, title, wikitext in results:
-        url = WIKIPEDIA_WIKI_URL + title.replace(' ', '_')
-
-        snippets_rows = []
-        snippets = self.parser.extract(wikitext)
-        for sec, snips in snippets:
-            sec = section_name_to_anchor(sec)
-            for sni in snips:
-                id = mkid(title + sni)
-                row = (id, sni, sec, pageid)
-                snippets_rows.append(row)
-
-        if snippets_rows:
-            article_row = (pageid, url, title)
-            rows.append({'article': article_row, 'snippets': snippets_rows})
-    # Open a short-lived connection to try to avoid the limit of 20 per user:
-    # https://phabricator.wikimedia.org/T216170
-    db = chdb.init_scratch_db()
-    for r in rows:
-        db.execute_with_retry(insert, r)
-
-def parse_live(pageids, sentences, timeout):
+def parse_live(pageids, cd_data, timeout):
     backdir = tempfile.mkdtemp(prefix = 'citationhunt_parse_live_')
     pool = multiprocessing.Pool(
         # The number of processes per CPU is pretty much made up. The processes
@@ -248,10 +210,11 @@ def parse_live(pageids, sentences, timeout):
             tasks.append(pageids_list[i:i+batch_size])
         result = pool.map_async(work, tasks)
     else:
-        revids_list = list(set([revid for revid, _ in sentences]))
+        revids_list = list(set([revid for revid, sentence in cd_data]))
         for i in range(0, len(revids_list), batch_size):
-            tasks.append([row for row in sentences if row[0] in revids_list[i:i+batch_size]])
-        result = pool.map_async(work_sentences, tasks)
+            revids_batch = revids_list[i:i+batch_size]
+            tasks.append([row for row in cd_data if row[0] in revids_batch])
+        result = pool.map_async(work, tasks)
 
     pool.close()
 
@@ -292,7 +255,7 @@ def parse_live(pageids, sentences, timeout):
     shutil.rmtree(backdir)
     return ret
 
-def load_sentences_from_cd(score):
+def load_from_cd(score):
     db = chdb.init_cd_db()
     cursor = db.cursor()
     cursor.execute(
@@ -312,7 +275,8 @@ if __name__ == '__main__':
             pageids = set(map(str.strip, pf))
         ret = parse_live(pageids, None, timeout)
     else:
-        sentences = load_sentences_from_cd(0.5)
-        ret = parse_live(None, sentences, timeout)
+        score = float(arguments['<score>'])
+        cd_data = load_from_cd(score)
+        ret = parse_live(None, cd_data, timeout)
     logger.info('all done in %d seconds.' % (time.time() - start))
     sys.exit(ret)
