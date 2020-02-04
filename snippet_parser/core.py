@@ -249,6 +249,10 @@ class SnippetParser(object):
 
         for strip_selector in self._html_css_selectors_to_strip:
             for element in strip_selector(tree):
+                # Make sure we don't remove elements inside the markers.
+                # For a few Wikipedias (Chinese, Russian) the expansion of
+                # {{fact}} is marked as .noprint, which we otherwise want
+                # to remove.
                 inside_marker = any(
                     e.attrib.get('class') == marker_class
                     for e in element.iterancestors('span'))
@@ -274,6 +278,11 @@ class SnippetParser(object):
             for marker in tree.cssselect('.' + marker_class):
                 lxml_utils.remove_element(marker)
 
+            # Keep only snippet root top-level elements within the body
+            # that have any text content (we may have created empty elements
+            # above during cleanup). This is not great as any content within,
+            # say, <blockquote> gets removed entirely, but it's good enough
+            # in most cases.
             snippet_roots = [
                 self._make_snippet_root(*(
                     e for e in tree.cssselect(
@@ -283,6 +292,10 @@ class SnippetParser(object):
 
         snippets_in_section = set()
         for sr in snippet_roots:
+            # Some last-minute cleanup to shrink the snippet some more.
+            # Remove links and attributes, but make sure to keep the
+            # class in our marker elements, and that there is no space
+            # before it (which we need for the UI).
             lxml.etree.strip_tags(sr, 'a')
             markers_in_snippet = sr.cssselect(
                 '.' + marker_class)
@@ -303,6 +316,10 @@ class SnippetParser(object):
     def _parse_section_title(self, i, section):
         sectitle = ''
         if i != 0:
+            # Re-parse the section title because fast_parse is
+            # configured to ignore style tags (see above and
+            # https://github.com/earwig/mwparserfromhell/issues/40),
+            # but we do want to remove them now with strip_code().
             sectitle = mwparserfromhell.parse(
                 str(section.get(0).title).strip()).strip_code()
         return sectitle
