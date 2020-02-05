@@ -184,7 +184,7 @@ class SnippetParser(object):
 
             # Reference groups can cause an error message to be
             # generated directly in the output HTML, remove them.
-            self._remove_reference_group(section)
+            self._remove_reference_groups(section)
 
             # Note: we could gain a little speedup here by breaking the section
             # into paragraphs and taking only the paragraphs we want before
@@ -214,11 +214,10 @@ class SnippetParser(object):
         wikicode = mwparserfromhell.parse(wikitext)
         sections = wikicode.get_sections(
             include_lead = True, include_headings = True, flat = True)
-
         snippets = []
         minlen, maxlen = self._cfg.snippet_min_size, self._cfg.snippet_max_size
         for i, section in enumerate(sections):
-            self._remove_reference_group(section)
+            self._remove_reference_groups(section)
             try:
                 html = self._convert_to_html(section)
             except:
@@ -230,7 +229,7 @@ class SnippetParser(object):
             snippets.append([sectitle, list(snippets_in_section)])
         return snippets
 
-    def _remove_reference_group(self, section):
+    def _remove_reference_groups(self, section):
         for ref in section.filter_tags(matches = lambda t: t.tag == 'ref'):
             if ref.has('group'):
                 ref.remove('group')
@@ -303,6 +302,7 @@ class SnippetParser(object):
             sr.attrib['class'] = SNIPPET_WRAPPER_CLASS
             for marker in markers_in_snippet:
                 marker.attrib['class'] = marker_class
+                if marker_class == 'sentence-marker': continue
                 lxml_utils.strip_space_before_element(marker)
 
             length = len(sr.text_content().strip())

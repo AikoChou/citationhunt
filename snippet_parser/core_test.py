@@ -146,5 +146,42 @@ class SnippetParserTest(unittest.TestCase):
             "== Section title ''with Wikicode'' == \n\nIrrelevant content{{cn}}")
         self.assertEqual(section, 'Section title with Wikicode')
 
+    def _do_extract_citationdetective(self, html, wikitext='{{ cn }}',
+                                      sentences=['{{ cn }}']):
+        self._set_wikipedia_parse_response(html)
+        ret = self._sp.extract_from_sentences(wikitext, sentences)
+        call_args = None
+        if self._wp.parse.call_count:
+            call_args = self._wp.parse.call_args[0][0]
+        ret = ret[0] if ret else []
+        return call_args, ret
+
+    def test_sentence_to_snippet(self):
+        sent = ['A sentence.']
+        text = 'Stuff. A sentence. More stuff.'
+        marked_text, _ = self._do_extract_citationdetective('html', text, sent)
+        marked_text = marked_text['text']
+        _, [_, snippets] = self._do_extract_citationdetective(marked_text)
+        expected = '<div class="%s"><p>Stuff. ' % (core.SNIPPET_WRAPPER_CLASS
+            ) + core._SENTENCE_MARKER_MARKUP.format(sent = 'A sentence.'
+            ) + ' More stuff.</p></div>'
+        self.assertEqual(expected, snippets[0])
+
+    def test_sentence_not_found(self):
+        sent = ['A sentence.']
+        text = 'Missing the sentence in the [[Wikitext]].'
+        marked_text, _ = self._do_extract_citationdetective('html', text, sent)
+        marked_text = marked_text['text']
+        _, [_, snippets] = self._do_extract_citationdetective(marked_text)
+        self.assertFalse(snippets)
+
+    def test_too_long_sentence(self):
+        sent = ['A '+'very '*1000+'long sentence.']
+        text = 'Stuff. A '+'very '*1000+'long sentence. More stuff.'
+        marked_text, _ = self._do_extract_citationdetective('html', text, sent)
+        marked_text = marked_text['text']
+        _, [_, snippets] = self._do_extract_citationdetective(marked_text)
+        self.assertFalse(snippets)
+
 if __name__ == '__main__':
     unittest.main()

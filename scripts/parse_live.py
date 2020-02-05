@@ -9,7 +9,7 @@ valid snippets in the `articles` database table, and the snippets in the
 `snippets` table.
 
 Usage:
-    parse_live.py (--import_from_citationdetective <score> | <pageid-file>) [--timeout=<n>]
+    parse_live.py (--import_from_citationdetective | <pageid-file>) [--timeout=<n>]
 
 Options:
     --timeout=<n>    Maximum time in seconds to run for [default: inf].
@@ -25,8 +25,7 @@ if _upper_dir not in sys.path:
 
 import chdb
 import config
-import yamwapi
-import mwapi
+import yamwapi as mwapi
 import snippet_parser
 from utils import *
 
@@ -73,7 +72,7 @@ def section_name_to_anchor(section):
     section = section.replace('%', '.')
     return section
 
-def query_pageids(wiki, pageids, revids):
+def query_article_data(wiki, pageids, revids):
     params = {
         'prop': 'revisions',
         'rvprop': 'ids|content'
@@ -100,7 +99,7 @@ self = types.SimpleNamespace() # Per-process state
 def initializer(backdir):
     self.backdir = backdir
 
-    self.wiki = yamwapi.MediaWikiAPI(WIKIPEDIA_API_URL, cfg.user_agent)
+    self.wiki = mwapi.MediaWikiAPI(WIKIPEDIA_API_URL, cfg.user_agent)
     self.parser = snippet_parser.create_snippet_parser(self.wiki, cfg)
     self.exception_count = 0
 
@@ -160,18 +159,18 @@ def insert(cursor, r):
             (r['article'][0],))
 
 @with_max_exceptions
-def work(job):
+def work(citation_detective, job):
     rows = []
-    CD_flag = True if isinstance(job[0], tuple) else False
-    if not CD_flag:
-        results = query_pageids(self.wiki, job, None)
+    if not citation_detective:
+        results = query_article_data(self.wiki, job, None)
     else:
-        results = query_pageids(self.wiki, None, set([row[0] for row in job]))
+        results = query_article_data(
+            self.wiki, None, set([row[0] for row in job]))
     for pageid, revid, title, wikitext in results:
         url = WIKIPEDIA_WIKI_URL + title.replace(' ', '_')
 
         snippets_rows = []
-        if not CD_flag:
+        if not citation_detective:
             snippets = self.parser.extract(wikitext)
         else:
             sentences = [row[1] for row in job if row[0] == revid]
@@ -208,13 +207,16 @@ def parse_live(pageids, cd_data, timeout):
         pageids_list = list(pageids)
         for i in range(0, len(pageids), batch_size):
             tasks.append(pageids_list[i:i+batch_size])
-        result = pool.map_async(work, tasks)
+        result = pool.map_async(functools.partial(work, False), tasks)
     else:
+        # A revid might have multiple sentences and appear repeatedly
+        # in the rows.
+        # TODO Test larger dataset to see if we need to chunck cd_data
         revids_list = list(set([revid for revid, sentence in cd_data]))
         for i in range(0, len(revids_list), batch_size):
             revids_batch = revids_list[i:i+batch_size]
             tasks.append([row for row in cd_data if row[0] in revids_batch])
-        result = pool.map_async(work, tasks)
+        result = pool.map_async(functools.partial(work, True), tasks)
 
     pool.close()
 
@@ -275,8 +277,7 @@ if __name__ == '__main__':
             pageids = set(map(str.strip, pf))
         ret = parse_live(pageids, None, timeout)
     else:
-        score = float(arguments['<score>'])
-        cd_data = load_from_cd(score)
+        cd_data = load_from_cd(cfg.citationdetective_min_score)
         ret = parse_live(None, cd_data, timeout)
     logger.info('all done in %d seconds.' % (time.time() - start))
     sys.exit(ret)
