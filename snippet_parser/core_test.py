@@ -146,9 +146,13 @@ class SnippetParserTest(unittest.TestCase):
             "== Section title ''with Wikicode'' == \n\nIrrelevant content{{cn}}")
         self.assertEqual(section, 'Section title with Wikicode')
 
-    def _do_extract_citationdetective(self, html, wikitext='{{ cn }}',
-                                      sentences=['{{ cn }}']):
-        self._set_wikipedia_parse_response(html)
+    def _do_extract_sentences(self, wikitext, sentences):
+        for sentence in sentences:
+            start = wikitext.find(sentence)
+            if start < 0: continue
+            marked = core._SENTENCE_MARKER_MARKUP.format(sent = sentence)
+            wikitext = wikitext[:start] + marked + wikitext[start+len(sentence):]
+        self._set_wikipedia_parse_response(wikitext)
         ret = self._sp.extract_from_sentences(wikitext, sentences)
         call_args = None
         if self._wp.parse.call_count:
@@ -157,31 +161,48 @@ class SnippetParserTest(unittest.TestCase):
         return call_args, ret
 
     def test_sentence_to_snippet(self):
-        sent = ['A sentence.']
-        text = 'Stuff. A sentence. More stuff.'
-        marked_text, _ = self._do_extract_citationdetective('html', text, sent)
-        marked_text = marked_text['text']
-        _, [_, snippets] = self._do_extract_citationdetective(marked_text)
+        sentences = ['A sentence.']
+        wikitext = '<p>Stuff. A sentence. More stuff.</p>'
+        _, [_, snippets]  = self._do_extract_sentences(wikitext, sentences)
         expected = '<div class="%s"><p>Stuff. ' % (core.SNIPPET_WRAPPER_CLASS
             ) + core._SENTENCE_MARKER_MARKUP.format(sent = 'A sentence.'
             ) + ' More stuff.</p></div>'
         self.assertEqual(expected, snippets[0])
 
     def test_sentence_not_found(self):
-        sent = ['A sentence.']
-        text = 'Missing the sentence in the [[Wikitext]].'
-        marked_text, _ = self._do_extract_citationdetective('html', text, sent)
-        marked_text = marked_text['text']
-        _, [_, snippets] = self._do_extract_citationdetective(marked_text)
+        sentences = ['A sentence.']
+        wikitext = "<p>Missing the sentence in the Wikitext.</p>"
+        _, [_, snippets] = self._do_extract_sentences(wikitext, sentences)
         self.assertFalse(snippets)
 
-    def test_too_long_sentence(self):
-        sent = ['A '+'very '*1000+'long sentence.']
-        text = 'Stuff. A '+'very '*1000+'long sentence. More stuff.'
-        marked_text, _ = self._do_extract_citationdetective('html', text, sent)
-        marked_text = marked_text['text']
-        _, [_, snippets] = self._do_extract_citationdetective(marked_text)
+    def test_lengthy_sentence(self):
+        sentences = ['A '+'very '*1000+'long sentence.']
+        wikitext = '<p>Stuff. A '+'very '*1000+'long sentence. More stuff.</p>'
+        _, [_, snippets] = self._do_extract_sentences(wikitext, sentences)
         self.assertFalse(snippets)
+
+    def test_sentence_in_list(self):
+        sentences = ['Element 3']
+        wikitext = '''
+            <p>The following is a list of elements:</p>
+            <ul>
+                <li>Element 1</li>
+                <li>Element 2</li>
+                <li>Element 3</li>
+                <li>Element 4</li>
+                <li>Element 5</li>
+            </ul>
+        '''
+        _, [_, snippets]  = self._do_extract_sentences(wikitext, sentences)
+        self.assertEqual(len(snippets), 1)
+        s = snippets[0]
+        self.assertIn('<p>The following', s)
+        self.assertNotIn('<li>Element 1', s)
+        self.assertIn('<li>Element 2', s)
+        self.assertIn(core.SENTENCE_MARKER_CLASS, s)
+        self.assertIn(core._SENTENCE_MARKER_MARKUP.format(sent = 'Element 3'), s)
+        self.assertIn('<li>Element 4', s)
+        self.assertNotIn('<li>Element 5', s)
 
 if __name__ == '__main__':
     unittest.main()

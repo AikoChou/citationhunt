@@ -269,7 +269,7 @@ class SnippetParser(object):
                 if root is None:
                     continue
                 if root.tag in _LIST_TAGS:
-                    snippet_roots = self._html_list_to_snippets(root)
+                    snippet_roots = self._html_list_to_snippets(root, marker_class)
                 else:
                     snippet_roots = [self._make_snippet_root(root)]
         else:
@@ -329,9 +329,9 @@ class SnippetParser(object):
         root.extend(copy(e) for e in child_elements)
         return root
 
-    def _html_list_to_snippets(self, list_element):
+    def _html_list_to_snippets(self, list_element, marker_class):
         """
-        Given a list element containing a citation needed marker in one of
+        Given a list element containing the marker class in one of
         its <li>, extract a snippet by taking the <li> with the marker plus
         a couple of other <li> for context, dropping all other items.
 
@@ -351,7 +351,7 @@ class SnippetParser(object):
             # the <li> rather than the marker itself - the <li> will be
             # the first ancestor of the marker.
             './/li/descendant::*[@class="%s"]/ancestor::li[1]' % (
-                CITATION_NEEDED_MARKER_CLASS)))
+                marker_class)))
         snippet_roots = []
         for li_with_marker in lis_with_marker:
             sr = self._make_snippet_root(*preamble)
