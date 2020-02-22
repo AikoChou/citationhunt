@@ -9,7 +9,7 @@ valid snippets in the `articles` database table, and the snippets in the
 `snippets` table.
 
 Usage:
-    parse_live.py <pageid-file> [--timeout=<n>]
+    parse_live.py (--import_from_citationdetective | <pageid-file>) [--timeout=<n>]
 
 Options:
     --timeout=<n>    Maximum time in seconds to run for [default: inf].
@@ -72,14 +72,19 @@ def section_name_to_anchor(section):
     section = section.replace('%', '.')
     return section
 
-def query_pageids(wiki, pageids):
+def query_article_data(wiki, pageids, revids):
     params = {
-        'pageids': '|'.join(map(str, pageids)),
         'prop': 'revisions',
-        'rvprop': 'content'
+        'rvprop': 'ids|content'
     }
+    if pageids:
+        params['pageids'] = '|'.join(map(str, pageids))
+    else:
+        params['revids'] = '|'.join(map(str, revids))
+
     for response in self.wiki.query(params):
         for id, page in list(response['query']['pages'].items()):
+            revid = page['revisions'][0]['revid']
             if 'title' not in page:
                 continue
             title = d(page['title'])
@@ -87,7 +92,7 @@ def query_pageids(wiki, pageids):
             if not text:
                 continue
             text = d(text)
-            yield (id, title, text)
+            yield (id, revid, title, text)
 
 self = types.SimpleNamespace() # Per-process state
 
@@ -125,15 +130,51 @@ def with_max_exceptions(fn):
                 raise
     return wrapper
 
+def insert(cursor, r):
+    cursor.execute('''
+        INSERT INTO articles VALUES(%s, %s, %s)''', r['article'])
+    cursor.executemany('''
+        INSERT IGNORE INTO snippets VALUES(%s, %s, %s, %s)''',
+        r['snippets'])
+
+    # We can't allow data to be truncated for HTML snippets, as that can
+    # completely break the UI, so we detect truncation warnings and get rid
+    # of the corresponding data.
+    warnings = cursor.execute('SHOW WARNINGS')
+    truncated_snippets = []
+    for _, _, message in cursor.fetchall():
+        m = DATA_TRUNCATED_WARNING_RE.match(message)
+        if m is None:
+            # Not a truncation, ignore (it's already logged)
+            continue
+        # MySQL warnings index rows starting at 1
+        idx = int(m.groups()[0]) - 1
+        truncated_snippets.append((r['snippets'][idx][0],))
+    if len(truncated_snippets) < len(r['snippets']):
+        cursor.executemany('''
+            DELETE FROM snippets WHERE id = %s''', truncated_snippets)
+    else:
+        # Every single snippet was truncated, remove the article itself
+        cursor.execute('''DELETE FROM articles WHERE page_id = %s''',
+            (r['article'][0],))
+
 @with_max_exceptions
-def work(pageids):
+def work(citation_detective, job):
     rows = []
-    results = query_pageids(self.wiki, pageids)
-    for pageid, title, wikitext in results:
+    if not citation_detective:
+        results = query_article_data(self.wiki, job, None)
+    else:
+        results = query_article_data(
+            self.wiki, None, set([row[0] for row in job]))
+    for pageid, revid, title, wikitext in results:
         url = WIKIPEDIA_WIKI_URL + title.replace(' ', '_')
 
         snippets_rows = []
-        snippets = self.parser.extract(wikitext)
+        if not citation_detective:
+            snippets = self.parser.extract(wikitext)
+        else:
+            sentences = [row[1] for row in job if row[0] == revid]
+            snippets = self.parser.extract_from_sentences(wikitext, sentences)
         for sec, snips in snippets:
             sec = section_name_to_anchor(sec)
             for sni in snips:
@@ -144,41 +185,13 @@ def work(pageids):
         if snippets_rows:
             article_row = (pageid, url, title)
             rows.append({'article': article_row, 'snippets': snippets_rows})
-
-    def insert(cursor, r):
-        cursor.execute('''
-            INSERT INTO articles VALUES(%s, %s, %s)''', r['article'])
-        cursor.executemany('''
-            INSERT IGNORE INTO snippets VALUES(%s, %s, %s, %s)''',
-            r['snippets'])
-
-        # We can't allow data to be truncated for HTML snippets, as that can
-        # completely break the UI, so we detect truncation warnings and get rid
-        # of the corresponding data.
-        warnings = cursor.execute('SHOW WARNINGS')
-        truncated_snippets = []
-        for _, _, message in cursor.fetchall():
-            m = DATA_TRUNCATED_WARNING_RE.match(message)
-            if m is None:
-                # Not a truncation, ignore (it's already logged)
-                continue
-            # MySQL warnings index rows starting at 1
-            idx = int(m.groups()[0]) - 1
-            truncated_snippets.append((r['snippets'][idx][0],))
-        if len(truncated_snippets) < len(r['snippets']):
-            cursor.executemany('''
-                DELETE FROM snippets WHERE id = %s''', truncated_snippets)
-        else:
-            # Every single snippet was truncated, remove the article itself
-            cursor.execute('''DELETE FROM articles WHERE page_id = %s''',
-                (r['article'][0],))
     # Open a short-lived connection to try to avoid the limit of 20 per user:
     # https://phabricator.wikimedia.org/T216170
     db = chdb.init_scratch_db()
     for r in rows:
         db.execute_with_retry(insert, r)
 
-def parse_live(pageids, timeout):
+def parse_live(pageids, cd_data, timeout):
     backdir = tempfile.mkdtemp(prefix = 'citationhunt_parse_live_')
     pool = multiprocessing.Pool(
         # The number of processes per CPU is pretty much made up. The processes
@@ -186,14 +199,25 @@ def parse_live(pageids, timeout):
         processes = multiprocessing.cpu_count() * 8,
         initializer = initializer, initargs = (backdir,))
 
-    # Make sure we query the API 32 pageids at a time
+    # Make sure we query the API 32 pageids/revids at a time
     tasks = []
     batch_size = 32
-    pageids_list = list(pageids)
-    for i in range(0, len(pageids), batch_size):
-        tasks.append(pageids_list[i:i+batch_size])
 
-    result = pool.map_async(work, tasks)
+    if pageids:
+        pageids_list = list(pageids)
+        for i in range(0, len(pageids), batch_size):
+            tasks.append(pageids_list[i:i+batch_size])
+        result = pool.map_async(functools.partial(work, False), tasks)
+    else:
+        # A revid might have multiple sentences and appear repeatedly
+        # in the rows.
+        # TODO Test larger dataset to see if we need to chunck cd_data
+        revids_list = list(set([revid for revid, sentence in cd_data]))
+        for i in range(0, len(revids_list), batch_size):
+            revids_batch = revids_list[i:i+batch_size]
+            tasks.append([row for row in cd_data if row[0] in revids_batch])
+        result = pool.map_async(functools.partial(work, True), tasks)
+
     pool.close()
 
     if timeout is not None:
@@ -233,6 +257,14 @@ def parse_live(pageids, timeout):
     shutil.rmtree(backdir)
     return ret
 
+def load_from_cd(score):
+    db = chdb.init_cd_db()
+    cursor = db.cursor()
+    cursor.execute(
+        '''SELECT rev_id, statement FROM statements WHERE score > %s
+         ORDER BY rev_id''' % score)
+    return cursor.fetchall()
+
 if __name__ == '__main__':
     arguments = docopt.docopt(__doc__)
     pageids_file = arguments['<pageid-file>']
@@ -240,8 +272,12 @@ if __name__ == '__main__':
     if timeout == float('inf'):
         timeout = None
     start = time.time()
-    with open(pageids_file) as pf:
-        pageids = set(map(str.strip, pf))
-    ret = parse_live(pageids, timeout)
+    if pageids_file:
+        with open(pageids_file) as pf:
+            pageids = set(map(str.strip, pf))
+        ret = parse_live(pageids, None, timeout)
+    else:
+        cd_data = load_from_cd(cfg.citationdetective_min_score)
+        ret = parse_live(None, cd_data, timeout)
     logger.info('all done in %d seconds.' % (time.time() - start))
     sys.exit(ret)

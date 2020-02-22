@@ -35,6 +35,10 @@
     color: #0645AD;
 }
 
+#snippet .sentence-marker {
+    background-color: gold;
+}
+
 #snippet h3 {
     font-size: 16px;
 }

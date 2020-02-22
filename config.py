@@ -115,6 +115,9 @@ _BASE_LANG_CONFIG = dict(
     # code itself. Whatever the fallback is, it MUST match the name of some
     # file inside the chstrings/ directory.
     accept_language = [],
+
+    # The minimum score to query sentences in citationdetecive.
+    citationdetective_min_score = 0.5
 )
 
 # Language-specific config, inheriting from the base config above.

@@ -28,6 +28,10 @@ CITATION_NEEDED_MARKER_CLASS = 'ch-cn-marker'
 _CITATION_NEEDED_MARKER_MARKUP = (
     '<span class="%s">{tpl}</span>' % CITATION_NEEDED_MARKER_CLASS)
 
+SENTENCE_MARKER_CLASS = 'sentence-marker'
+_SENTENCE_MARKER_MARKUP = (
+    '<span class="%s">{sent}</span>' % SENTENCE_MARKER_CLASS)
+
 _LIST_TAGS = set(['ol', 'ul'])
 _SNIPPET_ROOT_TAGS = set(['p']) | _LIST_TAGS
 
@@ -180,9 +184,7 @@ class SnippetParser(object):
 
             # Reference groups can cause an error message to be
             # generated directly in the output HTML, remove them.
-            for ref in section.filter_tags(matches = lambda t: t.tag == 'ref'):
-                if ref.has('group'):
-                    ref.remove('group')
+            self._remove_reference_groups(section)
 
             # Note: we could gain a little speedup here by breaking the section
             # into paragraphs and taking only the paragraphs we want before
@@ -191,102 +193,145 @@ class SnippetParser(object):
             # even within template parameters!
 
             try:
-                params = dict(
-                    text = str(section), **self._cfg.html_parse_parameters)
-                html = self._wikipedia.parse(params)['parse']['text']['*']
+                html = self._convert_to_html(section)
             except:
                 continue
 
-            tree = lxml.html.parse(
-                StringIO.StringIO(html),
-                parser = lxml.html.HTMLParser(
-                    encoding = 'utf-8', remove_comments = True)).getroot()
-            if tree is None: continue
-
-            for strip_selector in self._html_css_selectors_to_strip:
-                for element in strip_selector(tree):
-                    # Make sure we don't remove elements inside the markers.
-                    # For a few Wikipedias (Chinese, Russian) the expansion of
-                    # {{fact}} is marked as .noprint, which we otherwise want
-                    # to remove.
-                    inside_marker = any(
-                        e.attrib.get('class') == CITATION_NEEDED_MARKER_CLASS
-                        for e in element.iterancestors('span'))
-                    if not inside_marker:
-                        lxml_utils.remove_element(element)
-
-            snippet_roots = []
-            if self._cfg.extract == 'snippet':
-                # We climb up from each marker to the nearest antecessor element
-                # that we can use as a snippet.
-                for marker in tree.cssselect('.' + CITATION_NEEDED_MARKER_CLASS):
-                    root = marker.getparent()
-                    while root is not None and root.tag not in _SNIPPET_ROOT_TAGS:
-                        root = root.getparent()
-                    if root is None:
-                        continue
-                    if root.tag in _LIST_TAGS:
-                        snippet_roots = self._html_list_to_snippets(root)
-                    else:
-                        snippet_roots = [self._make_snippet_root(root)]
-            else:
-                # Throw away the actual template, we don't need it.
-                for marker in tree.cssselect('.' + CITATION_NEEDED_MARKER_CLASS):
-                    lxml_utils.remove_element(marker)
-
-                # Keep only snippet root top-level elements within the body
-                # that have any text content (we may have created empty elements
-                # above during cleanup). This is not great as any content within,
-                # say, <blockquote> gets removed entirely, but it's good enough
-                # in most cases.
-                snippet_roots = [
-                    self._make_snippet_root(*(
-                        e for e in tree.cssselect(
-                            'body > ' + ', '.join(_SNIPPET_ROOT_TAGS))
-                        if e.text_content() and not e.text_content().isspace()))
-                ]
-
-            snippets_in_section = set()
-            for sr in snippet_roots:
-                # Some last-minute cleanup to shrink the snippet some more.
-                # Remove links and attributes, but make sure to keep the
-                # class in our marker elements, and that there is no space
-                # before it (which we need for the UI).
-                lxml.etree.strip_tags(sr, 'a')
-                markers_in_snippet = sr.cssselect(
-                    '.' + CITATION_NEEDED_MARKER_CLASS)
-                lxml.etree.strip_attributes(sr, 'id', 'class', 'style')
-                sr.attrib['class'] = SNIPPET_WRAPPER_CLASS
-                for marker in markers_in_snippet:
-                    marker.attrib['class'] = CITATION_NEEDED_MARKER_CLASS
-                    lxml_utils.strip_space_before_element(marker)
-
-                length = len(sr.text_content().strip())
-                self.stats.snippet_lengths[length] += 1
-                if minlen < length < maxlen:
-                    snippet = d(lxml.html.tostring(
-                        sr, encoding = 'utf-8', method = 'html')).strip()
-                    snippets_in_section.add(snippet)
-
-            sectitle = ''
-            if i != 0:
-                # Re-parse the section title because fast_parse is
-                # configured to ignore style tags (see above and 
-                # https://github.com/earwig/mwparserfromhell/issues/40),
-                # but we do want to remove them now with strip_code().
-                sectitle = mwparserfromhell.parse(
-                    str(section.get(0).title).strip()).strip_code()
+            snippets_in_section = self._parse_snippets(
+                html, CITATION_NEEDED_MARKER_CLASS, minlen, maxlen)
+            if snippets_in_section is None: continue
+            sectitle = self._parse_section_title(i, section)
             snippets.append([sectitle, list(snippets_in_section)])
         return snippets
+
+    def extract_from_sentences(self, wikitext, sentences):
+        for sentence in sentences:
+            start = wikitext.find(sentence)
+            if start < 0: continue
+            marked = _SENTENCE_MARKER_MARKUP.format(sent = sentence)
+            wikitext = wikitext[:start] + marked + wikitext[start+len(sentence):]
+
+        wikicode = mwparserfromhell.parse(wikitext)
+        sections = wikicode.get_sections(
+            include_lead = True, include_headings = True, flat = True)
+        snippets = []
+        minlen, maxlen = self._cfg.snippet_min_size, self._cfg.snippet_max_size
+        for i, section in enumerate(sections):
+            self._remove_reference_groups(section)
+            try:
+                html = self._convert_to_html(section)
+            except:
+                continue
+            snippets_in_section = self._parse_snippets(
+                html, SENTENCE_MARKER_CLASS, minlen, maxlen)
+            if snippets_in_section is None: continue
+            sectitle = self._parse_section_title(i, section)
+            snippets.append([sectitle, list(snippets_in_section)])
+        return snippets
+
+    def _remove_reference_groups(self, section):
+        for ref in section.filter_tags(matches = lambda t: t.tag == 'ref'):
+            if ref.has('group'):
+                ref.remove('group')
+
+    def _convert_to_html(self, section):
+        params = dict(
+            text = str(section), **self._cfg.html_parse_parameters)
+        return self._wikipedia.parse(params)['parse']['text']['*']
+
+    def _parse_snippets(self, html, marker_class, minlen, maxlen):
+        tree = lxml.html.parse(
+            StringIO.StringIO(html),
+            parser = lxml.html.HTMLParser(
+                encoding = 'utf-8', remove_comments = True)).getroot()
+        if tree is None: return
+
+        for strip_selector in self._html_css_selectors_to_strip:
+            for element in strip_selector(tree):
+                # Make sure we don't remove elements inside the markers.
+                # For a few Wikipedias (Chinese, Russian) the expansion of
+                # {{fact}} is marked as .noprint, which we otherwise want
+                # to remove.
+                inside_marker = any(
+                    e.attrib.get('class') == marker_class
+                    for e in element.iterancestors('span'))
+                if not inside_marker:
+                    lxml_utils.remove_element(element)
+
+        snippet_roots = []
+        if self._cfg.extract == 'snippet':
+            # We climb up from each marker to the nearest antecessor element
+            # that we can use as a snippet.
+            for marker in tree.cssselect('.' + marker_class):
+                root = marker.getparent()
+                while root is not None and root.tag not in _SNIPPET_ROOT_TAGS:
+                    root = root.getparent()
+                if root is None:
+                    continue
+                if root.tag in _LIST_TAGS:
+                    snippet_roots = self._html_list_to_snippets(root, marker_class)
+                else:
+                    snippet_roots = [self._make_snippet_root(root)]
+        else:
+            # Throw away the actual template, we don't need it.
+            for marker in tree.cssselect('.' + marker_class):
+                lxml_utils.remove_element(marker)
+
+            # Keep only snippet root top-level elements within the body
+            # that have any text content (we may have created empty elements
+            # above during cleanup). This is not great as any content within,
+            # say, <blockquote> gets removed entirely, but it's good enough
+            # in most cases.
+            snippet_roots = [
+                self._make_snippet_root(*(
+                    e for e in tree.cssselect(
+                        'body > ' + ', '.join(_SNIPPET_ROOT_TAGS))
+                    if e.text_content() and not e.text_content().isspace()))
+            ]
+
+        snippets_in_section = set()
+        for sr in snippet_roots:
+            # Some last-minute cleanup to shrink the snippet some more.
+            # Remove links and attributes, but make sure to keep the
+            # class in our marker elements, and that there is no space
+            # before it (which we need for the UI).
+            lxml.etree.strip_tags(sr, 'a')
+            markers_in_snippet = sr.cssselect(
+                '.' + marker_class)
+            lxml.etree.strip_attributes(sr, 'id', 'class', 'style')
+            sr.attrib['class'] = SNIPPET_WRAPPER_CLASS
+            for marker in markers_in_snippet:
+                marker.attrib['class'] = marker_class
+                if marker_class == 'sentence-marker': continue
+                lxml_utils.strip_space_before_element(marker)
+
+            length = len(sr.text_content().strip())
+            self.stats.snippet_lengths[length] += 1
+            if minlen < length < maxlen:
+                snippet = d(lxml.html.tostring(
+                    sr, encoding = 'utf-8', method = 'html')).strip()
+                snippets_in_section.add(snippet)
+        return snippets_in_section
+
+    def _parse_section_title(self, i, section):
+        sectitle = ''
+        if i != 0:
+            # Re-parse the section title because fast_parse is
+            # configured to ignore style tags (see above and
+            # https://github.com/earwig/mwparserfromhell/issues/40),
+            # but we do want to remove them now with strip_code().
+            sectitle = mwparserfromhell.parse(
+                str(section.get(0).title).strip()).strip_code()
+        return sectitle
 
     def _make_snippet_root(self, *child_elements):
         root = lxml.html.Element('div')
         root.extend(copy(e) for e in child_elements)
         return root
 
-    def _html_list_to_snippets(self, list_element):
+    def _html_list_to_snippets(self, list_element, marker_class):
         """
-        Given a list element containing a citation needed marker in one of
+        Given a list element containing the marker class in one of
         its <li>, extract a snippet by taking the <li> with the marker plus
         a couple of other <li> for context, dropping all other items.
 
@@ -306,7 +351,7 @@ class SnippetParser(object):
             # the <li> rather than the marker itself - the <li> will be
             # the first ancestor of the marker.
             './/li/descendant::*[@class="%s"]/ancestor::li[1]' % (
-                CITATION_NEEDED_MARKER_CLASS)))
+                marker_class)))
         snippet_roots = []
         for li_with_marker in lis_with_marker:
             sr = self._make_snippet_root(*preamble)
