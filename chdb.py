@@ -77,12 +77,6 @@ def _connect_to_wp_mysql(cfg):
         kwds['host'] = '%s.analytics.db.svc.eqiad.wmflabs' % xxwiki
     return _connect(**kwds)
 
-def _connect_to_cd_mysql():
-    kwds = {'read_default_file': REPLICA_MY_CNF}
-    if utils.running_in_tools_labs():
-        kwds['host'] = TOOLS_LABS_CH_MYSQL_HOST
-    return _connect(**kwds)
-
 def _make_tools_labs_dbname(cursor, database, lang_code):
     cursor.execute("SELECT SUBSTRING_INDEX(USER(), '@', 1)")
     user = cursor.fetchone()[0]
@@ -135,8 +129,9 @@ def init_wp_replica_db(lang_code):
 def init_cd_db():
     cfg = config.get_localized_config()
     def connect_and_initialize():
-        db = _connect_to_cd_mysql()
-        _use(db.cursor(), 'citationdetective', cfg.lang_code)
+        db = _connect_to_ch_mysql()
+        with db.cursor() as cursor:
+            cursor.execute('USE ' + 's54245__citationdetective_p')
         return db
     return _RetryingConnection(connect_and_initialize)
 

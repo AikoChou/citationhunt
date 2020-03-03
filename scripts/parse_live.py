@@ -261,7 +261,7 @@ def load_from_cd(score):
     db = chdb.init_cd_db()
     cursor = db.cursor()
     cursor.execute(
-        '''SELECT rev_id, statement FROM statements WHERE score > %s
+        '''SELECT rev_id, sentence FROM sentences WHERE score > %s
          ORDER BY rev_id''' % score)
     return cursor.fetchall()
 

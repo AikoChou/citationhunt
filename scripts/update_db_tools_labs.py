@@ -23,7 +23,7 @@ def email(message, attachments):
     subprocess.getoutput(
         '/usr/bin/mail -s "%s" ' % message +
         ' '.join('-a ' + a for a in attachments) +
-        ' citationhunt.update@tools.wmflabs.org')
+        ' aiko-citationhunt.update@tools.wmflabs.org')
     time.sleep(2*60)
 
 def shell(cmdline):
@@ -94,17 +94,17 @@ def _update_db_tools_labs(cfg):
         cmdline = ' '.join([sys.executable, script_path, cmdline])
         assert shell(cmdline) == True or optional, 'Failed at %s' % script
 
-    unsourced = tempfile.NamedTemporaryFile()
-    run_script(
-        'print_unsourced_pageids_from_wikipedia.py', '> ' + unsourced.name)
-    run_script('parse_live.py', unsourced.name)
+    #unsourced = tempfile.NamedTemporaryFile()
+    #run_script(
+    #    'print_unsourced_pageids_from_wikipedia.py', '> ' + unsourced.name)
+    #run_script('parse_live.py', unsourced.name)
     if cfg.lang_code == 'en':
         run_script('parse_live.py --import_from_citationdetective')
     run_script('assign_categories.py')
     run_script('update_intersections.py')
     run_script('install_new_database.py')
 
-    unsourced.close()  # deletes the file
+    #unsourced.close()  # deletes the file
 
 def update_db_tools_labs(cfg):
     # Should match the job's name in crontab

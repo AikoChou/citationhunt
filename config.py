@@ -117,7 +117,7 @@ _BASE_LANG_CONFIG = dict(
     accept_language = [],
 
     # The minimum score to query sentences in citationdetecive.
-    citationdetective_min_score = 0.5
+    citationdetective_min_score = 0.9
 )
 
 # Language-specific config, inheriting from the base config above.
