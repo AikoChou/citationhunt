@@ -36,7 +36,7 @@ _LIST_TAGS = set(['ol', 'ul'])
 _SNIPPET_ROOT_TAGS = set(['p']) | _LIST_TAGS
 
 class SnippetParser(object):
-    '''A base class for snippet parsers in various languages.'''
+    '''Turn wikitext into HTML snippets for Citation Hunt.'''
 
     def __init__(self, wikipedia, cfg):
         self._cfg = cfg
@@ -269,9 +269,9 @@ class SnippetParser(object):
                 if root is None:
                     continue
                 if root.tag in _LIST_TAGS:
-                    snippet_roots = self._html_list_to_snippets(root, marker_class)
+                    snippet_roots.extend(self._html_list_to_snippets(root, marker_class))
                 else:
-                    snippet_roots = [self._make_snippet_root(root)]
+                    snippet_roots.append(self._make_snippet_root(root))
         else:
             # Throw away the actual template, we don't need it.
             for marker in tree.cssselect('.' + marker_class):
